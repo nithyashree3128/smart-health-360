@@ -1,0 +1,90 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function role() {
+      // Custom claim, set only by the onUserCreate Cloud Function — never
+      // writable by the client. This is the actual security boundary;
+      // users/{uid}.role is a convenience mirror for the UI only.
+      return request.auth.token.role;
+    }
+    function isRole(r) {
+      return signedIn() && role() == r;
+    }
+    function myFacilityId() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.facilityId;
+    }
+
+    // users/{uid} — a user can read/update their own doc (not their role
+    // field — that's claim-controlled). Officers can read any user in scope.
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isRole('officer'));
+      allow create: if false; // written only by the onUserCreate function
+      allow update: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.role == resource.data.role; // role is immutable client-side
+    }
+
+    // facilities — public read (patients need this to find care), staff-only write
+    match /facilities/{facilityId} {
+      allow read: if true;
+      allow write: if isRole('officer');
+    }
+
+    // beds — public read for the bed finder; doctors/officers can update
+    // counts for their own facility
+    match /beds/{bedId} {
+      allow read: if true;
+      allow write: if (isRole('doctor') || isRole('officer'))
+                   && (isRole('officer') || resource.data.facilityId == myFacilityId());
+    }
+
+    // inventory — pharmacist/officer only, scoped to own facility for pharmacists
+    match /inventory/{itemId} {
+      allow read: if isRole('pharmacist') || isRole('doctor') || isRole('officer');
+      allow write: if isRole('officer')
+                   || (isRole('pharmacist') && resource.data.facilityId == myFacilityId());
+    }
+
+    // patientQueue — patients can create their own entry; doctors/officers manage the queue
+    match /patientQueue/{entryId} {
+      allow read: if isRole('doctor') || isRole('officer')
+                  || (isRole('patient') && resource.data.patientUid == request.auth.uid);
+      allow create: if isRole('patient') && request.resource.data.patientUid == request.auth.uid;
+      allow update, delete: if isRole('doctor') || isRole('officer');
+    }
+
+    // grievances — patients create + read their own; officers triage all
+    match /grievances/{id} {
+      allow read: if isRole('officer')
+                  || (isRole('patient') && resource.data.patientUid == request.auth.uid);
+      allow create: if isRole('patient') && request.resource.data.patientUid == request.auth.uid;
+      allow update: if isRole('officer'); // resolving a grievance
+    }
+
+    // outbreaks — public read, officer write (usually via Cloud Function ingest)
+    match /outbreaks/{id} {
+      allow read: if true;
+      allow write: if isRole('officer');
+    }
+
+    // redistributionContracts — proposed by Cloud Function (admin SDK bypasses
+    // rules), approved/rejected by officers only
+    match /redistributionContracts/{id} {
+      allow read: if isRole('officer') || isRole('pharmacist');
+      allow create: if false; // matcher function only
+      allow update: if isRole('officer');
+    }
+
+    // sosEvents — a patient can create/read their own; doctors/officers see all
+    match /sosEvents/{id} {
+      allow read: if isRole('doctor') || isRole('officer')
+                  || (isRole('patient') && resource.data.patientUid == request.auth.uid);
+      allow create: if isRole('patient') && request.resource.data.patientUid == request.auth.uid;
+      allow update: if isRole('doctor') || isRole('officer');
+    }
+  }
+}
